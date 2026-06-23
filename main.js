@@ -473,7 +473,7 @@ module.exports = class OtohaReaderPlugin extends Plugin {
     this.addCommand({ id: "prev", name: "Previous sentence", callback: () => this.reader.playFrom(this.reader.idx - 1) });
 
     this.addSettingTab(new OtohaSettingTab(this.app, this));
-    this.startCommandServer();
+    this.syncCommandServer();
 
     // Track the bound note's visibility across tab switches: clear the stale
     // highlight when it leaves screen, and snap to the current sentence when it
@@ -493,30 +493,41 @@ module.exports = class OtohaReaderPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on("file-open", onNav));
   }
 
-  // Reverse channel: let the Otoha menu-bar app control Obsidian playback.
-  // A tiny localhost HTTP listener (desktop/Node only) exposes /stop and /toggle.
-  startCommandServer() {
-    try {
-      const http = require("http");
-      this.cmdServer = http.createServer((req, res) => {
-        const u = req.url || "";
-        try {
-          if (u.startsWith("/stop")) this.reader.stop();
-          else if (u.startsWith("/toggle")) this.reader.toggle();
-        } catch (e) { /* ignore */ }
-        res.writeHead(200, { "Content-Type": "text/plain" });
-        res.end("ok");
-      });
-      this.cmdServer.on("error", () => {}); // port busy / unsupported — ignore
-      this.cmdServer.listen(8767, "127.0.0.1");
-    } catch (e) { /* no Node http available — skip reverse control */ }
+  // Reverse channel: let the Otoha menu-bar app control Obsidian playback via a
+  // tiny loopback HTTP listener (desktop/Node only) exposing /stop and /toggle.
+  // It runs ONLY while the Kokoro engine is active — i.e. only when the user is
+  // actually using the Otoha app. The device engine never opens a listener.
+  // Call on load and whenever the engine changes.
+  syncCommandServer() {
+    const want = this.settings.engine === "kokoro";
+    if (want && !this.cmdServer) {
+      try {
+        const http = require("http");
+        this.cmdServer = http.createServer((req, res) => {
+          const u = req.url || "";
+          try {
+            if (u.startsWith("/stop")) this.reader.stop();
+            else if (u.startsWith("/toggle")) this.reader.toggle();
+          } catch (e) { /* ignore */ }
+          res.writeHead(200, { "Content-Type": "text/plain" });
+          res.end("ok");
+        });
+        this.cmdServer.on("error", () => {}); // port busy / unsupported — ignore
+        this.cmdServer.listen(8767, "127.0.0.1");
+      } catch (e) { /* no Node http available — skip reverse control */ }
+    } else if (!want && this.cmdServer) {
+      try { this.cmdServer.close(); } catch (e) {}
+      this.cmdServer = null;
+    }
   }
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     if (!this.settings.engine) {
-      // First run: built-in voice on mobile (no server), Kokoro on desktop.
-      this.settings.engine = Platform && Platform.isMobile ? "device" : "kokoro";
+      // First run: default to the built-in device voice so it works immediately
+      // with no server/app. Users opt into Kokoro (via the Otoha app) for neural
+      // voices in settings.
+      this.settings.engine = "device";
     }
   }
 
@@ -529,6 +540,7 @@ module.exports = class OtohaReaderPlugin extends Plugin {
       this.reader.serverUrl = this.settings.serverUrl;
       this.reader.cache = {}; // voice/speed/engine changed -> drop stale audio clips
     }
+    this.syncCommandServer(); // start/stop the app-control listener to match the engine
     this.applyHighlightColor();
   }
 
@@ -543,7 +555,8 @@ module.exports = class OtohaReaderPlugin extends Plugin {
     this.clearAllHighlights();
     this.detachPreviewListeners();
     if (this.bar) this.bar.remove();
-    if (this.cmdServer) { try { this.cmdServer.close(); } catch (e) {} }
+    if (this.cmdServer) { try { this.cmdServer.close(); } catch (e) {} this.cmdServer = null; }
+    document.body.style.removeProperty("--otoha-highlight"); // don't leave our CSS var behind
   }
 
   // Floating, always-visible transport bar (the status bar is too easy to miss).
@@ -1059,16 +1072,22 @@ class OtohaSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Engine")
-      .setDesc("Kokoro = the local warm server (best quality). Device = your OS built-in voice (works offline, no server — good for phone).")
+      .setDesc("Device = your OS built-in voice (works offline, no setup). Kokoro = high-quality neural voices via the free Otoha app.")
       .addDropdown((dd) => {
-        dd.addOption("kokoro", "Kokoro (server)");
         dd.addOption("device", "Device (built-in)");
+        dd.addOption("kokoro", "Kokoro (neural — Otoha app)");
         dd.setValue(this.plugin.settings.engine).onChange(async (v) => {
           this.plugin.settings.engine = v;
           await this.plugin.saveSettings();
           this.display(); // show/hide engine-specific rows
         });
       });
+
+    if (this.plugin.settings.engine !== "kokoro") {
+      new Setting(containerEl)
+        .setName("Want better voices?")
+        .setDesc("Install the free Otoha app for high-quality neural voices (all local), then choose the Kokoro engine: https://github.com/spacegrowth/otoha");
+    }
 
     if (this.plugin.settings.engine === "kokoro") {
       new Setting(containerEl)
